@@ -1,0 +1,9 @@
+export const ROLES = ['owner', 'admin', 'viewer'] as const
+export const UOM_SYMBOLS = ['g', 'kg', 'mg', 'mL', 'L', 'pza'] as const
+export const ENTRADA_STATUSES = ['draft', 'confirmed', 'cancelled'] as const
+export const TICKET_STATUSES = ['draft', 'confirmed', 'delivered', 'cancelled'] as const
+export const KARDEX_TIPOS = ['entrada', 'salida_venta', 'ajuste_manual', 'venta_declarada', 'merma'] as const
+export const NOTIF_TIPOS = ['stock_bajo', 'ticket_pendiente', 'invitacion'] as const
+export const DEFAULT_PAGE_LIMIT = 50
+export const MAX_CSV_ROWS = 1000
+export const INVITATION_EXPIRY_DAYS = 7
