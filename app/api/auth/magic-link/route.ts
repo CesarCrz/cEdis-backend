@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { ok, err } from '@/lib/utils/response'
 import { rateLimit, getRateLimitKey } from '@/lib/middleware/rate-limit'
+import { sendEmail, getMagicLinkTemplate } from '@/lib/email'
 
 const bodySchema = z.object({
   email: z.string().email(),
@@ -20,13 +21,23 @@ export async function POST(req: NextRequest) {
     return err('VALIDATION_ERROR', 'Invalid request body', 400, parsed.error.flatten())
   }
 
-  // Always return 200 — don't reveal whether the email exists
-  await supabaseAdmin.auth.signInWithOtp({
-    email: parsed.data.email,
+  const { email } = parsed.data
+  const frontendUrl = process.env.NEXT_PUBLIC_FRONTEND_URL ?? 'https://cedis.ceats.app'
+
+  // Generate link without sending — Supabase does not send email here
+  const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
+    type: 'magiclink',
+    email,
     options: {
-      emailRedirectTo: `${process.env.NEXT_PUBLIC_FRONTEND_URL}/auth/callback`,
+      redirectTo: `${frontendUrl}/auth/callback`,
     },
   })
 
+  // Send via Resend only if link was generated successfully
+  if (!linkError && linkData?.properties?.action_link) {
+    await sendEmail(email, getMagicLinkTemplate(email, linkData.properties.action_link))
+  }
+
+  // Always return 200 — don't reveal whether the email exists
   return ok({ message: 'If that email exists, a magic link has been sent.' })
 }
