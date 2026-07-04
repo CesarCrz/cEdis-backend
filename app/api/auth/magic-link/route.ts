@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
   await supabaseAdmin.auth.signInWithOtp({
     email: parsed.data.email,
     options: {
-      emailRedirectTo: `${process.env.FRONTEND_URL}/auth/callback`,
+      emailRedirectTo: `${process.env.NEXT_PUBLIC_FRONTEND_URL}/auth/callback`,
     },
   })
 
