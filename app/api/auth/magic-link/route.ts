@@ -21,9 +21,11 @@ export async function POST(req: NextRequest) {
   }
 
   // Always return 200 — don't reveal whether the email exists
-  await supabaseAdmin.auth.admin.generateLink({
-    type: 'magiclink',
+  await supabaseAdmin.auth.signInWithOtp({
     email: parsed.data.email,
+    options: {
+      emailRedirectTo: `${process.env.FRONTEND_URL}/auth/callback`,
+    },
   })
 
   return ok({ message: 'If that email exists, a magic link has been sent.' })
