@@ -8,6 +8,7 @@ import { logAction } from '@/lib/utils/audit-log'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { generateFolio } from '@/lib/utils/folio'
 import { createEntradaSchema } from '@/lib/validations/entrada'
+import { validateUnitTypes } from '@/lib/utils/receta-validation'
 
 type Params = { params: Promise<{ cedisId: string }> }
 
@@ -25,7 +26,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 
       let query = supabaseAdmin
         .from('entradas')
-        .select('*, proveedor:proveedores(id,nombre)', { count: 'exact' })
+        .select('*, proveedor:proveedores(id,nombre), items:entrada_items(id)', { count: 'exact' })
         .eq('cedis_id', cedisId)
 
       if (status) query = query.eq('status', status)
@@ -55,8 +56,13 @@ export async function POST(req: NextRequest, { params }: Params) {
 
       const { proveedor_id, notas, items } = parsed.data
 
+      // Reject duplicate insumos in same entrada
+      const insumoIds = items.map(i => i.insumo_id)
+      if (new Set(insumoIds).size !== insumoIds.length) {
+        return err('VALIDATION_ERROR', 'No se puede agregar el mismo insumo dos veces en una entrada', 400)
+      }
+
       // Validate insumos belong to cedis
-      const insumoIds = [...new Set(items.map(i => i.insumo_id))]
       const { data: insumos, error: insErr } = await supabaseAdmin
         .from('insumos')
         .select('id')
@@ -66,6 +72,10 @@ export async function POST(req: NextRequest, { params }: Params) {
       if (insErr || (insumos?.length ?? 0) < insumoIds.length) {
         return err('VALIDATION_ERROR', 'One or more insumos not found in this CEDIS', 400)
       }
+
+      // Validate unit type compatibility (peso/volumen/unidad)
+      const unitError = await validateUnitTypes(items, cedisId)
+      if (unitError) return err('VALIDATION_ERROR', unitError, 400)
 
       const folio = await generateFolio(supabaseAdmin, cedisId, 'ENT')
 
@@ -81,6 +91,7 @@ export async function POST(req: NextRequest, { params }: Params) {
           notas: notas ?? null,
           status: 'draft',
           usuario_id: userId,
+          total_costo,
         })
         .select()
         .single()

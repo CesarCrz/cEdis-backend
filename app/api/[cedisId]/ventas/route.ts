@@ -8,6 +8,7 @@ import { logAction } from '@/lib/utils/audit-log'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { generateFolio } from '@/lib/utils/folio'
 import { createTicketSchema } from '@/lib/validations/ticket'
+import { validateUnitTypes } from '@/lib/utils/receta-validation'
 
 type Params = { params: Promise<{ cedisId: string }> }
 
@@ -25,7 +26,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 
       let query = supabaseAdmin
         .from('tickets_venta')
-        .select('*, cliente:clientes(id,nombre)', { count: 'exact' })
+        .select('*, cliente:clientes(id,nombre), items:ticket_items(id)', { count: 'exact' })
         .eq('cedis_id', cedisId)
 
       if (status) query = query.eq('status', status)
@@ -55,15 +56,26 @@ export async function POST(req: NextRequest, { params }: Params) {
 
       const { cliente_id, notas, items } = parsed.data
 
-      // Validate cliente belongs to cedis
+      // Reject duplicate insumos in same ticket
+      const insumoIds = items.map(i => i.insumo_id)
+      if (new Set(insumoIds).size !== insumoIds.length) {
+        return err('VALIDATION_ERROR', 'No se puede agregar el mismo insumo dos veces en un ticket', 400)
+      }
+
+      // Validate unit type compatibility (peso/volumen/unidad)
+      const unitError = await validateUnitTypes(items, cedisId)
+      if (unitError) return err('VALIDATION_ERROR', unitError, 400)
+
+      // Validate cliente belongs to cedis and is active
       const { data: cliente } = await supabaseAdmin
         .from('clientes')
-        .select('id')
+        .select('id, activo')
         .eq('id', cliente_id)
         .eq('cedis_id', cedisId)
         .single()
 
       if (!cliente) return err('VALIDATION_ERROR', 'Cliente not found in this CEDIS', 400)
+      if (!cliente.activo) return err('VALIDATION_ERROR', 'Cliente inactivo', 400)
 
       const folio = await generateFolio(supabaseAdmin, cedisId, 'TKT')
       const total = items.reduce((sum, item) => sum + item.cantidad * item.precio_unitario, 0)
@@ -77,6 +89,7 @@ export async function POST(req: NextRequest, { params }: Params) {
           notas: notas ?? null,
           status: 'draft',
           usuario_id: userId,
+          total,
         })
         .select()
         .single()

@@ -6,6 +6,8 @@ import { ok, err } from '@/lib/utils/response'
 import { logAction } from '@/lib/utils/audit-log'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { updateRecetaSchema } from '@/lib/validations/receta'
+import { calcularCostoReceta, syncLinkedInsumo } from '@/lib/utils/receta-cost'
+import { wouldCreateCircle } from '@/lib/utils/receta-validation'
 
 type Params = { params: Promise<{ cedisId: string; id: string }> }
 
@@ -29,30 +31,19 @@ export async function GET(req: NextRequest, { params }: Params) {
         .eq('receta_id', id)
         .order('nombre')
 
-      // Fetch ingredientes with insumo + unidad info
+      // Fetch ingredientes with insumo + sub_receta + unidad info
       const { data: ingredientes } = await supabaseAdmin
         .from('receta_ingredientes')
-        .select('id, insumo_id, cantidad, unidad_id, insumo:insumos(id,nombre,costo_unitario,unidad_id), unidad:unidades_medida(id,nombre,simbolo,factor)')
+        .select(`
+          id, insumo_id, sub_receta_id, cantidad, unidad_id,
+          insumo:insumos(id,nombre,costo_unitario,unidad_id),
+          sub_receta:recetas!receta_ingredientes_sub_receta_id_fkey(id,nombre,rendimiento,rendimiento_unidad_id),
+          unidad:unidades_medida(id,nombre,simbolo,factor)
+        `)
         .eq('receta_id', id)
 
-      // Calculate costo_teorico per variation (base ingredients × factor)
-      let costoBase = 0
-      for (const ing of ingredientes ?? []) {
-        const insumo = (ing.insumo as unknown) as { costo_unitario: number; unidad_id: string } | null
-        const ingUnidad = (ing.unidad as unknown) as { factor: number } | null
-        if (!insumo || !ingUnidad) continue
-
-        // Get insumo's own unit factor
-        const { data: insumoUnidad } = await supabaseAdmin
-          .from('unidades_medida')
-          .select('factor')
-          .eq('id', insumo.unidad_id)
-          .single()
-
-        const fromFactor = Number(ingUnidad.factor)
-        const toFactor = Number(insumoUnidad?.factor ?? 1)
-        costoBase += (Number(ing.cantidad) * fromFactor / toFactor) * Number(insumo.costo_unitario)
-      }
+      // Use recursive cost utility
+      const costoBase = await calcularCostoReceta(id)
 
       const variacionesConCosto = (variaciones ?? []).map((v) => ({
         ...v,
@@ -92,26 +83,60 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
       if (fetchErr || !before) return err('NOT_FOUND', 'Receta not found', 404)
 
-      const { nombre, variaciones, ingredientes } = parsed.data
+      const { nombre, categoria_id, rendimiento, rendimiento_unidad_id, variaciones, ingredientes } = parsed.data
 
-      // Update receta nombre if provided
-      if (nombre !== undefined) {
+      // Build receta update patch
+      const recetaPatch: Record<string, unknown> = {}
+      if (nombre !== undefined) recetaPatch.nombre = nombre
+      if (categoria_id !== undefined) recetaPatch.categoria_id = categoria_id
+      if (rendimiento !== undefined) recetaPatch.rendimiento = rendimiento
+      if (rendimiento_unidad_id !== undefined) recetaPatch.rendimiento_unidad_id = rendimiento_unidad_id
+
+      if (Object.keys(recetaPatch).length > 0) {
         const { error: upErr } = await supabaseAdmin
           .from('recetas')
-          .update({ nombre })
+          .update(recetaPatch)
           .eq('cedis_id', cedisId)
           .eq('id', id)
         if (upErr) return err('DB_ERROR', 'Failed to update receta', 500)
       }
 
+      function buildIngRow(ing: { insumo_id?: string | null; sub_receta_id?: string | null; unidad_id: string; cantidad: number }) {
+        return {
+          receta_id: id,
+          insumo_id: ing.insumo_id ?? null,
+          sub_receta_id: ing.sub_receta_id ?? null,
+          unidad_id: ing.unidad_id,
+          cantidad: ing.cantidad,
+        }
+      }
+
+      // Validate ingredientes before writing
+      const allIngs = variaciones
+        ? variaciones.flatMap(v => v.ingredientes ?? [])
+        : (ingredientes ?? [])
+
+      if (allIngs.length > 0) {
+        // Reject duplicates
+        const ingKeys = allIngs.map(i => i.insumo_id ?? i.sub_receta_id ?? '')
+        if (new Set(ingKeys).size !== ingKeys.length) {
+          return err('VALIDATION_ERROR', 'Ingrediente duplicado en la receta', 400)
+        }
+
+        // Reject circular sub-receta references
+        const subRecetaIds = allIngs.map(i => i.sub_receta_id).filter(Boolean) as string[]
+        for (const srId of subRecetaIds) {
+          if (await wouldCreateCircle(id, srId)) {
+            return err('CONFLICT', 'Referencia circular detectada en sub-recetas', 409)
+          }
+        }
+      }
+
       // Atomically replace variaciones + ingredientes if provided
       if (variaciones !== undefined) {
-        // Delete existing variaciones (cascades to nothing since ingredientes are at receta level)
         await supabaseAdmin.from('receta_variaciones').delete().eq('receta_id', id)
-        // Delete existing ingredientes
         await supabaseAdmin.from('receta_ingredientes').delete().eq('receta_id', id)
 
-        // Re-insert variaciones
         for (const variacion of variaciones) {
           await supabaseAdmin.from('receta_variaciones').insert({
             receta_id: id,
@@ -121,37 +146,31 @@ export async function PATCH(req: NextRequest, { params }: Params) {
           })
         }
 
-        // Collect all unique ingredientes across variaciones
-        const ingMap = new Map<string, { insumo_id: string; unidad_id: string; cantidad: number }>()
+        // Deduplicate ingredientes across variaciones by insumo_id or sub_receta_id
+        const ingMap = new Map<string, ReturnType<typeof buildIngRow>>()
         for (const v of variaciones) {
           for (const ing of v.ingredientes ?? []) {
-            ingMap.set(ing.insumo_id, {
-              insumo_id: ing.insumo_id,
-              unidad_id: ing.unidad_id,
-              cantidad: ing.cantidad,
-            })
+            const key = ing.insumo_id ?? ing.sub_receta_id ?? ''
+            ingMap.set(key, buildIngRow(ing))
           }
         }
 
         if (ingMap.size > 0) {
-          await supabaseAdmin.from('receta_ingredientes').insert(
-            [...ingMap.values()].map((ing) => ({ receta_id: id, ...ing }))
-          )
+          await supabaseAdmin.from('receta_ingredientes').insert([...ingMap.values()])
         }
       } else if (ingredientes !== undefined) {
-        // Replace only ingredients
         await supabaseAdmin.from('receta_ingredientes').delete().eq('receta_id', id)
         if (ingredientes.length > 0) {
-          await supabaseAdmin.from('receta_ingredientes').insert(
-            ingredientes.map((ing) => ({
-              receta_id: id,
-              insumo_id: ing.insumo_id,
-              unidad_id: ing.unidad_id,
-              cantidad: ing.cantidad,
-            }))
-          )
+          await supabaseAdmin.from('receta_ingredientes').insert(ingredientes.map(buildIngRow))
         }
       }
+
+      // Calculate and persist cost
+      const costoBase = await calcularCostoReceta(id)
+      await supabaseAdmin.from('recetas').update({ costo_teorico_base: costoBase }).eq('id', id)
+
+      // Auto-sync cost to any linked semi-elaborado insumo
+      await syncLinkedInsumo(id, cedisId)
 
       const { data: updated } = await supabaseAdmin
         .from('recetas')

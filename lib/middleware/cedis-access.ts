@@ -3,6 +3,7 @@ import type { UserRole } from '@/types'
 const ROLE_WEIGHT: Record<UserRole, number> = {
   owner: 3,
   admin: 2,
+  operator: 2,
   viewer: 1,
 }
 

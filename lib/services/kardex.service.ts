@@ -20,24 +20,35 @@ export async function insertKardexEntry(entry: KardexEntry): Promise<void> {
   await supabaseAdmin.from('kardex').insert(entry)
 }
 
-// Update insumo stock atomically and return before/after values
+// Update insumo stock atomically using Postgres advisory lock via RPC.
+// Requires DB function: update_insumo_stock(p_insumo_id uuid, p_delta numeric)
 export async function updateInsumoStock(
   insumoId: string,
   deltaBase: number // positive=add, negative=subtract
 ): Promise<{ antes: number; despues: number }> {
-  const { data: insumo } = await supabaseAdmin
-    .from('insumos')
-    .select('stock_actual')
-    .eq('id', insumoId)
-    .single()
+  const { data, error } = await supabaseAdmin.rpc('update_insumo_stock', {
+    p_insumo_id: insumoId,
+    p_delta: deltaBase,
+  })
 
-  const antes = Number(insumo?.stock_actual ?? 0)
-  const despues = Math.max(0, antes + deltaBase) // never go below 0
+  if (error || !data || data.length === 0) {
+    // Fallback (non-atomic) if RPC not yet deployed
+    const { data: insumo } = await supabaseAdmin
+      .from('insumos')
+      .select('stock_actual')
+      .eq('id', insumoId)
+      .single()
+    const antes = Number(insumo?.stock_actual ?? 0)
+    const despues = Math.max(0, antes + deltaBase)
+    await supabaseAdmin
+      .from('insumos')
+      .update({ stock_actual: despues, updated_at: new Date().toISOString() })
+      .eq('id', insumoId)
+    return { antes, despues }
+  }
 
-  await supabaseAdmin
-    .from('insumos')
-    .update({ stock_actual: despues, updated_at: new Date().toISOString() })
-    .eq('id', insumoId)
-
-  return { antes, despues }
+  return {
+    antes: Number(data[0].stock_antes),
+    despues: Number(data[0].stock_despues),
+  }
 }

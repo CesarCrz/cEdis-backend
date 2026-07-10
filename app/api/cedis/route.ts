@@ -13,20 +13,61 @@ export async function GET(req: NextRequest) {
   const auth = await getAuthUser(req)
   if (auth instanceof Response) return auth
 
-  const { data, error } = await supabaseAdmin
-    .from('cedis')
-    .select(`
-      id, nombre, descripcion, created_at, updated_at, owner_id,
-      cedis_members!inner(role)
-    `)
-    .or(`owner_id.eq.${auth.userId},cedis_members.user_id.eq.${auth.userId}`)
-    .order('created_at', { ascending: false })
+  const SELECT = 'id, nombre, descripcion, created_at, updated_at, owner_id'
 
-  if (error) {
+  const [ownedResult, membershipsResult] = await Promise.all([
+    supabaseAdmin
+      .from('cedis')
+      .select(SELECT)
+      .eq('owner_id', auth.userId)
+      .order('created_at', { ascending: false }),
+    supabaseAdmin
+      .from('cedis_members')
+      .select('cedis_id, role')
+      .eq('user_id', auth.userId)
+      .not('accepted_at', 'is', null),
+  ])
+
+  if (ownedResult.error) {
+    console.error('[GET /api/cedis] owned query error:', ownedResult.error.message)
     return err('DB_ERROR', 'Failed to fetch CEDIS list', 500)
   }
 
-  return ok(data)
+  const membershipMap = new Map(
+    (membershipsResult.data ?? []).map((m) => [m.cedis_id, m.role as string])
+  )
+  const memberCedisIds = [...membershipMap.keys()]
+  let memberCedis: typeof ownedResult.data = []
+
+  if (memberCedisIds.length > 0) {
+    const { data, error } = await supabaseAdmin
+      .from('cedis')
+      .select(SELECT)
+      .in('id', memberCedisIds)
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      console.error('[GET /api/cedis] member cedis query error:', error.message)
+      return err('DB_ERROR', 'Failed to fetch CEDIS list', 500)
+    }
+    memberCedis = data ?? []
+  }
+
+  const seen = new Set<string>()
+  const ownedIds = new Set((ownedResult.data ?? []).map((c) => c.id))
+
+  const merged = [...(ownedResult.data ?? []), ...memberCedis]
+    .filter((c) => {
+      if (seen.has(c.id)) return false
+      seen.add(c.id)
+      return true
+    })
+    .map((c) => ({
+      ...c,
+      my_role: ownedIds.has(c.id) ? 'owner' : (membershipMap.get(c.id) ?? 'viewer'),
+    }))
+
+  return ok(merged)
 }
 
 export async function POST(req: NextRequest) {

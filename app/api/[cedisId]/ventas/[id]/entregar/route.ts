@@ -7,7 +7,6 @@ import { logAction } from '@/lib/utils/audit-log'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { insertKardexEntry, updateInsumoStock } from '@/lib/services/kardex.service'
 import { checkAndNotifyLowStock, getCedisMemberIds } from '@/lib/services/stock-alert.service'
-import { toBaseUnits } from '@/lib/utils/unit-conversion'
 
 type Params = { params: Promise<{ cedisId: string; id: string }> }
 
@@ -23,8 +22,8 @@ export async function POST(req: NextRequest, { params }: Params) {
           *,
           items:ticket_items(
             *,
-            insumo:insumos(id,stock_actual,stock_minimo),
-            unidad:unidades_medida(id,factor)
+            insumo:insumos(id, stock_actual, stock_minimo, nombre, unidad:unidades_medida(id, factor)),
+            unidad:unidades_medida(id, factor, simbolo)
           )
         `)
         .eq('id', id)
@@ -32,22 +31,44 @@ export async function POST(req: NextRequest, { params }: Params) {
         .single()
 
       if (error || !ticket) return err('NOT_FOUND', 'Ticket not found', 404)
-      if (ticket.status === 'delivered') return ok(ticket) // idempotent
+      if (ticket.status === 'delivered') return ok(ticket)
       if (ticket.status !== 'confirmed') return err('CONFLICT', `Cannot deliver ticket with status: ${ticket.status}`, 409)
+
+      // Validate stock availability for all items before touching anything
+      const stockErrors: string[] = []
+      for (const item of (ticket.items ?? [])) {
+        const entradaFactor = Number(item.unidad?.factor ?? 1)
+        const insumoFactor = Number((item.insumo as { unidad?: { factor?: number } })?.unidad?.factor ?? 1)
+        const delta = (Number(item.cantidad) * entradaFactor) / insumoFactor
+        const stockActual = Number(item.insumo?.stock_actual ?? 0)
+
+        if (stockActual < delta) {
+          const nombre = (item.insumo as { nombre?: string })?.nombre ?? item.insumo_id
+          const simbolo = item.unidad?.simbolo ?? ''
+          stockErrors.push(
+            `${nombre}: disponible ${stockActual}${simbolo}, solicitado ${Number(item.cantidad)}${simbolo}`
+          )
+        }
+      }
+
+      if (stockErrors.length > 0) {
+        return err('INSUFFICIENT_STOCK', `Stock insuficiente:\n${stockErrors.join('\n')}`, 409)
+      }
 
       const memberIds = await getCedisMemberIds(cedisId)
 
       for (const item of (ticket.items ?? [])) {
-        const factor = Number(item.unidad?.factor ?? 1)
-        const deltaBase = toBaseUnits(Number(item.cantidad), factor)
+        const entradaFactor = Number(item.unidad?.factor ?? 1)
+        const insumoFactor = Number((item.insumo as { unidad?: { factor?: number } })?.unidad?.factor ?? 1)
+        const delta = (Number(item.cantidad) * entradaFactor) / insumoFactor
 
-        const { antes, despues } = await updateInsumoStock(item.insumo_id, -deltaBase)
+        const { antes, despues } = await updateInsumoStock(item.insumo_id, -delta)
 
         await insertKardexEntry({
           cedis_id: cedisId,
           insumo_id: item.insumo_id,
           tipo: 'salida_venta',
-          cantidad: -deltaBase,
+          cantidad: -delta,
           unidad_id: item.unidad_id,
           stock_antes: antes,
           stock_despues: despues,
@@ -58,17 +79,13 @@ export async function POST(req: NextRequest, { params }: Params) {
           notas: `Entrega ticket ${ticket.folio}`,
         })
 
-        // Check low stock after each decrease
         const stockMinimo = Number(item.insumo?.stock_minimo ?? 0)
         await checkAndNotifyLowStock(cedisId, item.insumo_id, despues, stockMinimo, memberIds)
       }
 
       const { data: updated, error: upErr } = await supabaseAdmin
         .from('tickets_venta')
-        .update({
-          status: 'delivered',
-          delivered_at: new Date().toISOString(),
-        })
+        .update({ status: 'delivered', delivered_at: new Date().toISOString() })
         .eq('id', id)
         .select()
         .single()

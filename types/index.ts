@@ -1,4 +1,4 @@
-export type UserRole = 'owner' | 'admin' | 'viewer'
+export type UserRole = 'owner' | 'admin' | 'operator' | 'viewer'
 export type StockLevel = 'ok' | 'warn' | 'low' | 'critical'
 export type EntradaStatus = 'draft' | 'confirmed' | 'cancelled'
 export type TicketStatus = 'draft' | 'confirmed' | 'delivered' | 'cancelled'

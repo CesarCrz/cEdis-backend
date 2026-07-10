@@ -61,6 +61,14 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       }
 
       if (items) {
+        // Reject duplicate insumos
+        const ticketInsumoIds = items.map(i => i.insumo_id)
+        if (new Set(ticketInsumoIds).size !== ticketInsumoIds.length) {
+          return err('VALIDATION_ERROR', 'No se puede agregar el mismo insumo dos veces en un ticket', 400)
+        }
+
+        const total = items.reduce((sum, item) => sum + item.cantidad * item.precio_unitario, 0)
+
         await supabaseAdmin.from('ticket_items').delete().eq('ticket_id', id)
         await supabaseAdmin.from('ticket_items').insert(
           items.map(item => ({
@@ -71,6 +79,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
             precio_unitario: item.precio_unitario,
           }))
         )
+        await supabaseAdmin.from('tickets_venta').update({ total }).eq('id', id)
       }
 
       const { data: updated } = await supabaseAdmin

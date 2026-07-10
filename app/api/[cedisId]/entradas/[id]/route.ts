@@ -56,8 +56,13 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       }
 
       if (items) {
+        // Reject duplicate insumos
+        const insumoIds = items.map(i => i.insumo_id)
+        if (new Set(insumoIds).size !== insumoIds.length) {
+          return err('VALIDATION_ERROR', 'No se puede agregar el mismo insumo dos veces en una entrada', 400)
+        }
+
         // Validate insumos belong to cedis
-        const insumoIds = [...new Set(items.map(i => i.insumo_id))]
         const { data: insumos } = await supabaseAdmin
           .from('insumos')
           .select('id')
@@ -67,6 +72,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
         if ((insumos?.length ?? 0) < insumoIds.length) {
           return err('VALIDATION_ERROR', 'One or more insumos not found in this CEDIS', 400)
         }
+
+        const total_costo = items.reduce((sum, item) => sum + item.cantidad * item.costo_unitario, 0)
 
         // Replace items atomically
         await supabaseAdmin.from('entrada_items').delete().eq('entrada_id', id)
@@ -79,6 +86,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
             costo_unitario: item.costo_unitario,
           }))
         )
+        await supabaseAdmin.from('entradas').update({ total_costo }).eq('id', id)
       }
 
       const { data: updated } = await supabaseAdmin

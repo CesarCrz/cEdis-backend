@@ -102,6 +102,31 @@ export async function DELETE(req: NextRequest, { params }: Params) {
 
       if (fetchErr || !insumo) return err('NOT_FOUND', 'Insumo not found', 404)
 
+      // Guard: active recetas using this insumo
+      const { data: recetasActivas } = await supabaseAdmin
+        .from('receta_ingredientes')
+        .select('receta_id, receta:recetas!inner(id, nombre, activa)')
+        .eq('insumo_id', id)
+        .eq('receta:recetas.activa', true)
+        .limit(1)
+
+      if (recetasActivas && recetasActivas.length > 0) {
+        return err('CONFLICT', 'No se puede desactivar: insumo en uso por recetas activas', 409)
+      }
+
+      // Guard: pending tickets (draft or confirmed)
+      const { data: ticketsPendientes } = await supabaseAdmin
+        .from('ticket_items')
+        .select('ticket_id, ticket:tickets_venta!inner(id, status, cedis_id)')
+        .eq('insumo_id', id)
+        .in('ticket:tickets_venta.status', ['draft', 'confirmed'])
+        .eq('ticket:tickets_venta.cedis_id', cedisId)
+        .limit(1)
+
+      if (ticketsPendientes && ticketsPendientes.length > 0) {
+        return err('CONFLICT', 'No se puede desactivar: insumo en tickets pendientes', 409)
+      }
+
       // Soft delete
       const { error } = await supabaseAdmin
         .from('insumos')

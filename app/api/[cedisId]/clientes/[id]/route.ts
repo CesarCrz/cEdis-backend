@@ -82,6 +82,19 @@ export async function DELETE(req: NextRequest, { params }: Params) {
 
       if (fetchErr || !cliente) return err('NOT_FOUND', 'Cliente not found', 404)
 
+      // Guard: pending tickets for this cliente
+      const { data: ticketsPendientes } = await supabaseAdmin
+        .from('tickets_venta')
+        .select('id')
+        .eq('cliente_id', id)
+        .eq('cedis_id', cedisId)
+        .in('status', ['draft', 'confirmed'])
+        .limit(1)
+
+      if (ticketsPendientes && ticketsPendientes.length > 0) {
+        return err('CONFLICT', 'No se puede desactivar: cliente tiene tickets pendientes', 409)
+      }
+
       // Soft delete
       const { error } = await supabaseAdmin
         .from('clientes')

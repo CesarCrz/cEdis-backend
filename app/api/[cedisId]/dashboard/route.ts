@@ -174,7 +174,16 @@ export async function GET(req: NextRequest, { params }: Params) {
         ventas_por_dia,
         top_insumos,
         ventas_por_canal,
-        actividad_reciente: actividadResult.data ?? [],
+        actividad_reciente: (actividadResult.data ?? []).map((entry) => {
+          const u = entry.usuario as { full_name?: string } | null
+          return {
+            id: entry.id,
+            tipo: `${entry.action} ${entry.entity_type}`,
+            usuario_nombre: u?.full_name ?? 'Sistema',
+            created_at: entry.created_at,
+            detalles: entry.new_value ?? entry.old_value,
+          }
+        }),
       })
     })
   )

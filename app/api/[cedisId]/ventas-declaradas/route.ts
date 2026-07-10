@@ -7,7 +7,6 @@ import { parsePagination } from '@/lib/utils/pagination'
 import { logAction } from '@/lib/utils/audit-log'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { insertKardexEntry } from '@/lib/services/kardex.service'
-import { toBaseUnits } from '@/lib/utils/unit-conversion'
 import { createVentaDeclaradaSchema } from '@/lib/validations/venta-declarada'
 
 type Params = { params: Promise<{ cedisId: string }> }
@@ -26,7 +25,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 
       let query = supabaseAdmin
         .from('ventas_declaradas')
-        .select('*, cliente:clientes(id,nombre), canal:canales_venta(id,nombre)', { count: 'exact' })
+        .select('*, cliente:clientes(id,nombre), canal:canales_venta(id,nombre), items:venta_declarada_items(id,receta_id,cantidad_vendida)', { count: 'exact' })
         .eq('cedis_id', cedisId)
 
       if (clienteId) query = query.eq('cliente_id', clienteId)
@@ -84,6 +83,56 @@ export async function POST(req: NextRequest, { params }: Params) {
         return err('DB_ERROR', 'Failed to create venta declarada', 500)
       }
 
+      // Recursively flatten a recipe into {insumo_id → consumption in base units (g/mL)}
+      // multiplierBase = how many base-units of this recipe are needed
+      // rendimientoBase = how many base-units this recipe produces per batch
+      async function flattenConsumptions(
+        recetaId: string,
+        multiplierBase: number,
+        rendimientoBase: number,
+        visited: Set<string> = new Set()
+      ): Promise<Map<string, number>> {
+        const result = new Map<string, number>()
+        if (visited.has(recetaId) || rendimientoBase === 0) return result
+        visited.add(recetaId)
+
+        const { data: ingredientes } = await supabaseAdmin
+          .from('receta_ingredientes')
+          .select(`
+            insumo_id, sub_receta_id, cantidad,
+            unidad:unidades_medida(id,factor),
+            sub_receta:recetas!receta_ingredientes_sub_receta_id_fkey(id, rendimiento, rendimiento_unidad_id,
+              rendimiento_unidad:unidades_medida!recetas_rendimiento_unidad_id_fkey(id,factor))
+          `)
+          .eq('receta_id', recetaId)
+
+        const batchMultiplier = multiplierBase / rendimientoBase
+
+        for (const ing of (ingredientes ?? [])) {
+          const ingFactor = Number((ing.unidad as unknown as { factor: number } | null)?.factor ?? 1)
+          const cantBase = Number(ing.cantidad) * ingFactor * batchMultiplier
+
+          if (ing.insumo_id) {
+            result.set(ing.insumo_id, (result.get(ing.insumo_id) ?? 0) + cantBase)
+          } else if (ing.sub_receta_id) {
+            const sub = ing.sub_receta as unknown as {
+              id: string
+              rendimiento: number
+              rendimiento_unidad: { factor: number } | null
+            } | null
+            if (!sub) continue
+            const subRendFactor = Number(sub.rendimiento_unidad?.factor ?? 1)
+            const subRendBase = Number(sub.rendimiento) * subRendFactor
+            const subMap = await flattenConsumptions(sub.id, cantBase, subRendBase, new Set(visited))
+            for (const [insumoId, val] of subMap) {
+              result.set(insumoId, (result.get(insumoId) ?? 0) + val)
+            }
+          }
+        }
+
+        return result
+      }
+
       const ventaItems: Array<{
         venta_declarada_id: string
         receta_id: string
@@ -93,14 +142,6 @@ export async function POST(req: NextRequest, { params }: Params) {
 
       // Process each item: calculate theoretical consumption and insert kardex
       for (const item of items) {
-        // Get recipe ingredients with their units
-        let ingredientesQuery = supabaseAdmin
-          .from('receta_ingredientes')
-          .select('insumo_id, cantidad, unidad:unidades_medida(id,factor,simbolo)')
-          .eq('receta_id', item.receta_id)
-
-        const { data: ingredientes } = await ingredientesQuery
-
         // Get variation factor if provided
         let variacionFactor = 1
         if (item.variacion_id) {
@@ -112,30 +153,42 @@ export async function POST(req: NextRequest, { params }: Params) {
           variacionFactor = Number(variacion?.factor ?? 1)
         }
 
-        for (const ingrediente of (ingredientes ?? [])) {
-          const factor = Number((ingrediente.unidad as unknown as { factor: number } | null)?.factor ?? 1)
-          const cantidadBase = toBaseUnits(Number(ingrediente.cantidad), factor)
-          const consumoBase = cantidadBase * variacionFactor * item.cantidad_vendida
+        // Flatten all insumo consumptions including sub-recipes
+        // Top-level: rendimientoBase=1 because cantidad_vendida IS the unit count
+        const consumptionMap = await flattenConsumptions(
+          item.receta_id,
+          item.cantidad_vendida * variacionFactor,
+          1
+        )
 
-          // Get current insumo stock for before/after
-          const { data: insumo } = await supabaseAdmin
-            .from('insumos')
-            .select('stock_actual, unidad_id')
-            .eq('id', ingrediente.insumo_id)
-            .single()
+        // Batch-fetch all affected insumos for stock + unit info
+        const insumoIds = [...consumptionMap.keys()]
+        const { data: insumos } = await supabaseAdmin
+          .from('insumos')
+          .select('id, stock_actual, unidad_id, unidad:unidades_medida(id,factor)')
+          .in('id', insumoIds)
 
-          const stockAntes = Number(insumo?.stock_actual ?? 0)
-          const unidadId = insumo?.unidad_id ?? (ingrediente.unidad as unknown as { id: string } | null)?.id ?? ''
+        const insumoMap = new Map(
+          (insumos ?? []).map((ins) => [ins.id, ins])
+        )
 
-          // venta_declarada does NOT update insumos.stock_actual (theoretical only)
+        for (const [insumoId, cantBase] of consumptionMap) {
+          const insumo = insumoMap.get(insumoId)
+          if (!insumo) continue
+
+          const insumoFactor = Number((insumo.unidad as unknown as { factor: number } | null)?.factor ?? 1)
+          const consumoEnUnidad = insumoFactor > 0 ? cantBase / insumoFactor : cantBase
+
+          const stockAntes = Number(insumo.stock_actual ?? 0)
+
           await insertKardexEntry({
             cedis_id: cedisId,
-            insumo_id: ingrediente.insumo_id,
+            insumo_id: insumoId,
             tipo: 'venta_declarada',
-            cantidad: -consumoBase,
-            unidad_id: unidadId,
+            cantidad: -consumoEnUnidad,
+            unidad_id: insumo.unidad_id,
             stock_antes: stockAntes,
-            stock_despues: stockAntes, // no actual change
+            stock_despues: stockAntes, // theoretical only, no stock update
             referencia_tipo: 'venta_declarada',
             referencia_id: venta.id,
             cliente_id,

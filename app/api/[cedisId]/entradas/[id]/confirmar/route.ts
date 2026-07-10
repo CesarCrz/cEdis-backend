@@ -6,7 +6,6 @@ import { ok, err } from '@/lib/utils/response'
 import { logAction } from '@/lib/utils/audit-log'
 import { supabaseAdmin } from '@/lib/supabase/admin'
 import { insertKardexEntry, updateInsumoStock } from '@/lib/services/kardex.service'
-import { toBaseUnits } from '@/lib/utils/unit-conversion'
 
 type Params = { params: Promise<{ cedisId: string; id: string }> }
 
@@ -18,29 +17,52 @@ export async function POST(req: NextRequest, { params }: Params) {
 
       const { data: entrada, error: entErr } = await supabaseAdmin
         .from('entradas')
-        .select('*, items:entrada_items(*, insumo:insumos(id,stock_actual), unidad:unidades_medida(id,factor,simbolo))')
+        .select(`
+          *,
+          items:entrada_items(
+            *,
+            insumo:insumos(id, stock_actual, costo_unitario, unidad:unidades_medida(id, factor)),
+            unidad:unidades_medida(id, factor, simbolo)
+          )
+        `)
         .eq('id', id)
         .eq('cedis_id', cedisId)
         .single()
 
       if (entErr || !entrada) return err('NOT_FOUND', 'Entrada not found', 404)
 
-      // Idempotent: if already confirmed, return ok
       if (entrada.status === 'confirmed') return ok(entrada)
       if (entrada.status !== 'draft') return err('CONFLICT', `Cannot confirm entrada with status: ${entrada.status}`, 409)
 
-      // Process each item
       for (const item of (entrada.items ?? [])) {
-        const factor = Number(item.unidad?.factor ?? 1)
-        const deltaBase = toBaseUnits(Number(item.cantidad), factor)
+        // Convert entrada quantity to insumo's storage unit
+        // e.g. entrada in g (factor=1), insumo stored in kg (factor=1000) → delta = qty * 1 / 1000 = 0.003 kg
+        // e.g. entrada in kg (factor=1000), insumo stored in kg (factor=1000) → delta = qty * 1000 / 1000 = qty ✓
+        const entradaFactor = Number(item.unidad?.factor ?? 1)
+        const insumoFactor = Number((item.insumo as { unidad?: { factor?: number } })?.unidad?.factor ?? 1)
+        const delta = (Number(item.cantidad) * entradaFactor) / insumoFactor
 
-        const { antes, despues } = await updateInsumoStock(item.insumo_id, deltaBase)
+        const { antes, despues } = await updateInsumoStock(item.insumo_id, delta)
+
+        // Weighted average cost (in insumo's unit)
+        const costoAnterior = Number(item.insumo?.costo_unitario ?? 0)
+        const costoEntrada = Number(item.costo_unitario ?? 0)
+        if (costoEntrada > 0) {
+          const nuevoCosto =
+            antes > 0
+              ? (antes * costoAnterior + delta * costoEntrada) / despues
+              : costoEntrada
+          await supabaseAdmin
+            .from('insumos')
+            .update({ costo_unitario: Math.round(nuevoCosto * 10000) / 10000 })
+            .eq('id', item.insumo_id)
+        }
 
         await insertKardexEntry({
           cedis_id: cedisId,
           insumo_id: item.insumo_id,
           tipo: 'entrada',
-          cantidad: deltaBase,
+          cantidad: delta,
           unidad_id: item.unidad_id,
           stock_antes: antes,
           stock_despues: despues,
@@ -53,10 +75,7 @@ export async function POST(req: NextRequest, { params }: Params) {
 
       const { data: updated, error: upErr } = await supabaseAdmin
         .from('entradas')
-        .update({
-          status: 'confirmed',
-          confirmed_at: new Date().toISOString(),
-        })
+        .update({ status: 'confirmed', confirmed_at: new Date().toISOString() })
         .eq('id', id)
         .select()
         .single()

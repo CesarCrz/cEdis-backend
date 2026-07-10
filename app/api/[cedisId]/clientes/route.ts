@@ -76,6 +76,17 @@ export async function POST(req: NextRequest, { params }: Params) {
         return err('VALIDATION_ERROR', 'Invalid request body', 400, parsed.error.flatten())
       }
 
+      // Reject duplicate name within same CEDIS
+      const { data: existing } = await supabaseAdmin
+        .from('clientes')
+        .select('id')
+        .eq('cedis_id', cedisId)
+        .ilike('nombre', parsed.data.nombre)
+        .limit(1)
+        .maybeSingle()
+
+      if (existing) return err('CONFLICT', 'Ya existe un cliente con ese nombre en este CEDIS', 409)
+
       const { data, error } = await supabaseAdmin
         .from('clientes')
         .insert({ cedis_id: cedisId, ...parsed.data })
